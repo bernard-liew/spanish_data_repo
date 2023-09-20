@@ -1,0 +1,1659 @@
+---
+title: "7-iml"
+author: "Bernard"
+date: "2021-12-02"
+output: workflowr::wflow_html
+editor_options:
+  chunk_output_type: console
+---
+
+
+```{r, include = FALSE}
+knitr::opts_chunk$set(eval = FALSE)
+```
+
+# Load package
+
+```{r}
+
+# Helper
+library(tidyverse)
+library(data.table)
+library (cowplot)
+library (officer)
+library (flextable)
+library (dataPreparation)
+library (plotROC)
+# ML
+library (MASS)# Step AIC
+library (ncvreg)
+library (abess)# Best subset regression
+library (glmnet) # Lasso
+library (mboost) 
+library (earth) # mars
+library (SignifReg)
+# Parallel
+library (future)
+
+# P value custom
+
+p_extract <- function (x) {
+    
+    p <- x[2, "Pr(>Chi)"]
+    return (p)
+}
+
+performance <- function (y_pred, y_true) {
+  
+  c("Accuracy" = MLmetrics::Accuracy(y_pred, y_true),
+    "AUC" = MLmetrics::AUC(y_pred, y_true),
+    "Precision" = MLmetrics::Precision(y_true, y_pred, positive = NULL),
+    "Sensitivity" = MLmetrics::Sensitivity(y_true, y_pred, positive = NULL),
+    "Specificity" = MLmetrics::Specificity(y_true, y_pred, positive = NULL))
+}
+```
+
+# Import
+
+```{r}
+# bmr <- readRDS("output/resampling_models.RDS")
+# 
+# bmr2 <- as.data.table(bmr) %>%
+#   mutate (Model = mlr3misc::map (learner, "model"))
+
+dat <- readRDS("output/df.RDS")
+
+np_train <- dat$df_list$np$train_imp[,-1] %>% dplyr::select (-matches ("clinic"))
+np_test <- dat$df_list$np$test_imp[,-1]%>% dplyr::select (-matches ("clinic"))
+np_dat <- bind_rows(np_train, np_test)
+
+ap_train <- dat$df_list$ap$train_imp[,-1] %>% dplyr::select (-matches ("clinic"))
+ap_test <- dat$df_list$ap$test_imp[,-1]%>% dplyr::select (-matches ("clinic"))
+ap_dat <- bind_rows(ap_train, ap_test)
+
+dis_train <- dat$df_list$dis$train_imp[,-1]%>% dplyr::select (-matches ("clinic"))
+dis_test <- dat$df_list$dis$test_imp[,-1]%>% dplyr::select (-matches ("clinic"))
+dis_dat <- bind_rows(dis_train, dis_test)
+
+```
+
+# Neck
+
+## Scaling
+
+```{r}
+scales <- build_scales(np_train)
+np_train <- fast_scale(np_train, scales = scales)
+np_test <- fast_scale(np_test, scales = scales)
+```
+
+
+```{r}
+o <- np_test$outcome
+
+# P value unadjusted
+
+df <- np_train %>% 
+  mutate (outcome = as.numeric(outcome) - 1) 
+
+fullmodel <- glm(outcome ~., data = df, family = binomial)
+nullmodel <- glm(outcome ~1, data = df, family = binomial)
+
+scope = list(lower=formula(nullmodel ),upper=formula(fullmodel))
+
+np_m1 = SignifReg(fullmodel,
+                       scope=scope, 
+                       alpha = 0.05,
+                       direction = "both",
+                       criterion = "p-value",
+                       adjust.method = "none",
+                       trace=FALSE)
+
+p_m1 <- predict (np_m1, type = "response", newdata  = np_test %>% dplyr::select (-outcome))
+p_m1_bin <- ifelse (p_m1 > 0.5, 1, 0)
+
+res_m1 <- performance (y_pred = p_m1_bin,
+                       y_true = o)
+
+roc_m1 <- data.frame(m = p_m1,
+                     d = as.numeric (np_test$outcome) -1)
+
+
+# P value adjusted
+
+np_m2 = SignifReg(fullmodel,
+                       scope=scope, 
+                       alpha = 0.05,
+                       direction = "both",
+                       criterion = "p-value",
+                       adjust.method = "bonferroni",
+                       trace=FALSE)
+
+p_m2 <- predict (np_m2, type = "response", newdata  = np_test %>% dplyr::select (-outcome))
+p_m2_bin <- ifelse (p_m2 > 0.5, 1, 0)
+
+res_m2 <- performance (y_pred = p_m2_bin,
+                       y_true = o)
+
+roc_m2 <- data.frame(m = p_m2,
+                     d = as.numeric (np_test$outcome) -1)
+
+# Step AIC
+
+full_model <- glm (outcome ~ ., data = df, family = binomial())
+np_m3 <- stepAIC (full_model,
+                      direction = "both")
+summary (np_m3 )
+
+p_m3 <- predict (np_m3, type = "response", newdata  = np_test %>% dplyr::select (-outcome))
+p_m3_bin <- ifelse (p_m3> 0.5, 1, 0)
+
+res_m3 <- performance (y_pred = p_m3_bin,
+                       y_true = o)
+roc_m3 <- data.frame(m = p_m3,
+                     d = as.numeric (np_test$outcome) -1)
+
+
+# Best subset regression
+
+X_train <-  model.matrix(outcome ~., data = df)[,-1]
+Y_train <- as.numeric (df$outcome) 
+
+X_test <-  model.matrix(outcome ~., data = np_test)[,-1]
+Y_test <- as.numeric (np_test$outcome) -1
+
+np_m4 <- abess(x = X_train,
+                   y = Y_train,
+                   family = "binomial", 
+                   tune.type = "cv"
+                   )
+
+best_np_m4  <- np_m4 [["best.size"]]
+print(best_np_m3 )
+
+coef(np_m4 , support.size = best_np_m4 , sparse = FALSE)
+
+p_m4 <- predict (np_m4, type = "response", newx  = X_test, support.size = best_np_m4)
+p_m4_bin<- as.numeric (ifelse (p_m4 > 0.5, 1, 0))
+
+res_m4 <- performance (y_pred = p_m4_bin,
+                       y_true = Y_test)
+
+roc_m4 <- data.frame(m = p_m4[,1],
+                     d = as.numeric (np_test$outcome) -1)
+
+# Lasso
+
+np_m5 <- cv.ncvreg(X_train,
+                       Y_train,
+                       penalty = "lasso",
+                       family = "binomial")
+
+coef_np_m5 <- coef(np_m5, s = "lambda.min")[coef(np_m5, s = "lambda.min") != 0]
+
+p_m5 <- predict (np_m5, type = "response", X  = X_test, lambda = np_m5$lambda.min)
+p_m5_bin<- ifelse (p_m5 > 0.5, 1, 0)
+
+res_m5 <- performance (y_pred = p_m5_bin,
+                       y_true = Y_test)
+
+roc_m5 <- data.frame(m = p_m5,
+                     d = as.numeric (np_test$outcome) -1)
+
+## Refit lasso
+X_train_refit <- model.matrix(outcome ~., data = df)[,names(coef_np_m5)]
+
+
+np_m5_refit <- glm.fit(x = X_train_refit,
+                       y = Y_train,
+                       family = binomial())
+
+
+# NCVreg
+
+np_m6 <- cv.ncvreg(X_train,
+                     Y_train,
+                     type = "MCP",
+                     family = "binomial")
+
+coef_np_m6 <- coef(np_m6, s = "lambda.min")[coef(np_m6, s = "lambda.min") != 0]
+
+p_m6 <- predict (np_m6, type = "response", X  = X_test, lambda = np_m6$lambda.min)
+p_m6_bin<- ifelse (p_m6 > 0.5, 1, 0)
+
+res_m6 <- performance (y_pred = p_m6_bin,
+                       y_true = Y_test)
+roc_m6 <- data.frame(m = p_m6,
+                     d = as.numeric (np_test$outcome) -1)
+
+## Refit NCVreg
+X_train_refit <- model.matrix(outcome ~., data = df)[,names(coef_np_m6)]
+
+
+np_m6_refit <- glm.fit(x = X_train_refit,
+                       y = Y_train,
+                       family = binomial())
+
+# mboost
+
+df1 <- df %>%
+  mutate (outcome = factor (outcome, levels=0:1)) 
+
+np_m7  <- glmboost(outcome ~.,
+                      data = df1,
+                      control = boost_control(mstop = 2000, nu = 0.1),
+                      family = Binomial(type = c("glm"))) # coefficients from Binomial(link = 
+cvm <- cvrisk(np_m7) # , folds = cv10f)
+plot (cvm)
+np_m7 [mstop(cvm)]
+
+p_m7 <- predict (np_m7, type = "response", 
+                 newdata  = np_test %>% dplyr::select (-outcome))
+p_m7_bin <- ifelse (p_m7 > 0.5, 1, 0)
+
+res_m7<- performance (y_pred = p_m7_bin,
+                       y_true = Y_test)
+
+roc_m7 <- data.frame(m = p_m7,
+                     d = as.numeric (np_test$outcome) -1)
+
+## Refit mboost
+
+coef_np_m7 <- coef(np_m7)
+
+X_train_refit <- model.matrix(outcome ~., data = df)[,names(coef_np_m7)]
+
+
+np_m7_refit <- glm.fit(x = X_train_refit,
+                       y = Y_train,
+                       family = binomial())
+
+# MARS - linear
+
+np_m8 <- earth (outcome ~.,
+                   data = df,
+                   linpreds=TRUE,
+                   glm=list(family=binomial))
+
+
+p_m8 <- predict (np_m8, type = "response", newdata  = np_test %>% dplyr::select (-outcome))
+p_m8_bin<- ifelse (p_m8 > 0.5, 1, 0)
+
+res_m8 <- performance (y_pred = p_m8_bin,
+                       y_true = Y_test)
+
+roc_m8 <- data.frame(m = p_m8[,1],
+                     d = as.numeric (np_test$outcome) -1)
+
+
+```
+
+## Coef
+
+```{r}
+coef_np1 <- data.frame (variables = names (coef(np_m1)),
+                        pval = coef(np_m1))
+
+coef_np2 <- data.frame (variables = names (coef(np_m2)),
+                        pvalAdj = coef(np_m2))
+
+coef_np3 <- data.frame (variables = names (coef(np_m3)),
+                        stepaic = coef(np_m3))
+
+coef_np4 <- data.frame (variables = 
+                          rownames (coef(np_m4 , support.size = best_np_m4 , sparse = FALSE)),
+                        bestsubset = coef(np_m4 , support.size = best_np_m4 , sparse = FALSE)[,1])
+
+coef_np5 <- data.frame (variables = names (coef(np_m5, s = "lambda.min")[coef(np_m5, s = "lambda.min") != 0]),
+                        lasso = coef(np_m5, s = "lambda.min")[coef(np_m5, s = "lambda.min") != 0])
+
+coef_np5_refit <- data.frame (variables = names (coef(np_m5_refit)),
+                        lasso_refit = coef(np_m5_refit))
+
+
+coef_np6 <- data.frame (variables = names (coef(np_m6, s = "lambda.min")[coef(np_m6, s = "lambda.min") != 0]),
+                        mcp = coef(np_m6, s = "lambda.min")[coef(np_m6, s = "lambda.min") != 0])
+
+
+coef_np6_refit <- data.frame (variables = names (coef(np_m6_refit)),
+                        mcp_refit = coef(np_m6_refit))
+
+
+coef_np7 <- data.frame (variables = names (coef(np_m7)),
+                        mboost = coef(np_m7))
+
+coef_np7_refit <- data.frame (variables = names (coef(np_m7_refit)),
+                        mboost_refit = coef(np_m7_refit))
+
+coef_np8 <- data.frame (variables = names (coef(np_m8)),
+                        mars = coef(np_m8))
+
+
+np_predictors <- data.frame(variables = colnames (X_train)) %>%
+  left_join(coef_np1, by = "variables")  %>%
+  left_join(coef_np2, by = "variables") %>%
+  left_join(coef_np3, by = "variables") %>%
+  left_join(coef_np4, by = "variables")%>%
+  left_join(coef_np5, by = "variables")%>%
+  left_join(coef_np5_refit, by = "variables")%>%
+  left_join(coef_np6, by = "variables") %>%
+  #left_join(coef_np6_refit, by = "variables")%>%
+  left_join(coef_np7, by = "variables") %>%
+  left_join(coef_np7_refit, by = "variables")%>%
+  left_join(coef_np8, by = "variables") %>%
+  mutate_all(~ifelse(.x == 0, NA, .x)) %>%
+  mutate_if(is.numeric, round, 3) %>%
+  mutate (remove = rowSums(is.na(.[,-c(1, 7, 10)])),
+          keep = ifelse (remove == 0, "Y", "N"))
+
+np_predictors_best <- np_predictors %>%
+  filter (keep == "Y")
+
+```
+
+
+## Performance
+
+```{r}
+
+models_order <- c("pval", "pvalAdj", "stepaic", 
+                "bestsubset",  "lasso", "ncvreg", "mboost", "mars")
+
+np_res <- 
+cbind(Model = models_order, 
+      as.data.frame(do.call("rbind", list(res_m1, res_m2, res_m3, 
+                                          res_m4, res_m5, res_m6, res_m7, res_m8)))
+)
+
+np_roc <- bind_rows (roc_m1,
+                     roc_m2,
+                     roc_m3,
+                     roc_m4,
+                     roc_m5,
+                     roc_m6,
+                     roc_m7,
+                     roc_m8
+                     )
+np_roc$models <- rep(models_order, each = nrow (roc_m1)) 
+
+np_roc <- np_roc %>%
+  mutate (models = factor (models, levels = models_order))
+
+ggplot (np_roc) +
+  geom_roc (aes (m = m, d = d, color = models))
+```
+
+## Save
+
+```{r}
+np_all_models <- list ("pval" = np_m1, 
+                       "pvalAdj" = np_m2, 
+                       "stepaic" = np_m3, 
+                       "bestsubset" = np_m4, 
+                       "lasso"= np_m5, 
+                       "lasso_refit"= np_m5_refit, 
+                       "ncvreg"= np_m6,
+                       "ncvreg_refit"= np_m6_refit,  
+                       "mboost"= np_m7, 
+                       "mboost_refit"= np_m7_refit,
+                       "mars"= np_m8)
+
+np <- list (performance = np_res,
+            predictors = np_predictors,
+            models = np_all_models,
+            roc = np_roc)
+
+saveRDS(np, "output/np_iml2.RDS")
+```
+
+
+
+# Arm 
+
+## Scaling
+
+```{r}
+scales <- build_scales(ap_train)
+ap_train <- fast_scale(ap_train, scales = scales)
+ap_test <- fast_scale(ap_test, scales = scales)
+```
+
+
+```{r}
+o <- ap_test$outcome
+
+# P value unadjusted
+
+df <- ap_train %>% 
+  mutate (outcome = as.numeric(outcome) - 1) 
+
+fullmodel <- glm(outcome ~., data = df, family = binomial)
+nullmodel <- glm(outcome ~1, data = df, family = binomial)
+
+scope = list(lower=formula(nullmodel ),upper=formula(fullmodel))
+
+ap_m1 = SignifReg(fullmodel,
+                       scope=scope, 
+                       alpha = 0.05,
+                       direction = "both",
+                       criterion = "p-value",
+                       adjust.method = "none",
+                       trace=FALSE)
+
+p_m1 <- predict (ap_m1, type = "response", newdata  = ap_test %>% dplyr::select (-outcome))
+p_m1_bin <- ifelse (p_m1 > 0.5, 1, 0)
+
+res_m1 <- performance (y_pred = p_m1_bin,
+                       y_true = o)
+
+roc_m1 <- data.frame(m = p_m1,
+                     d = as.numeric (ap_test$outcome) -1)
+
+
+# P value adjusted
+
+ap_m2 = SignifReg(fullmodel,
+                       scope=scope, 
+                       alpha = 0.05,
+                       direction = "both",
+                       criterion = "p-value",
+                       adjust.method = "bonferroni",
+                       trace=FALSE)
+
+p_m2 <- predict (ap_m2, type = "response", newdata  = ap_test %>% dplyr::select (-outcome))
+p_m2_bin <- ifelse (p_m2 > 0.5, 1, 0)
+
+res_m2 <- performance (y_pred = p_m2_bin,
+                       y_true = o)
+
+roc_m2 <- data.frame(m = p_m2,
+                     d = as.numeric (ap_test$outcome) -1)
+
+# Step AIC
+
+full_model <- glm (outcome ~ ., data = df, family = binomial())
+ap_m3 <- stepAIC (full_model,
+                      direction = "both")
+
+p_m3 <- predict (ap_m3, type = "response", newdata  = ap_test %>% dplyr::select (-outcome))
+p_m3_bin <- ifelse (p_m3> 0.5, 1, 0)
+
+res_m3 <- performance (y_pred = p_m3_bin,
+                       y_true = o)
+roc_m3 <- data.frame(m = p_m3,
+                     d = as.numeric (ap_test$outcome) -1)
+
+
+# Best subset regression
+
+X_train <-  model.matrix(outcome ~., data = df)[,-1]
+Y_train <- as.numeric (df$outcome) 
+
+X_test <-  model.matrix(outcome ~., data = ap_test)[,-1]
+Y_test <- as.numeric (ap_test$outcome) -1
+
+ap_m4 <- abess(x = X_train,
+                   y = Y_train,
+                   family = "binomial", 
+                   tune.type = "cv"
+                   )
+
+best_ap_m4  <- ap_m4 [["best.size"]]
+
+p_m4 <- predict (ap_m4, type = "response", newx  = X_test, support.size = best_ap_m4)
+p_m4_bin<- as.numeric (ifelse (p_m4 > 0.5, 1, 0))
+
+res_m4 <- performance (y_pred = p_m4_bin,
+                       y_true = Y_test)
+
+roc_m4 <- data.frame(m = p_m4[,1],
+                     d = as.numeric (ap_test$outcome) -1)
+
+# Lasso
+
+ap_m5 <- cv.ncvreg(X_train,
+                       Y_train,
+                       penalty = "lasso",
+                       family = "binomial")
+
+coef_ap_m5 <- coef(ap_m5, s = "lambda.min")[coef(ap_m5, s = "lambda.min") != 0]
+
+p_m5 <- predict (ap_m5, type = "response", X  = X_test, lambda = ap_m5$lambda.min)
+p_m5_bin<- ifelse (p_m5 > 0.5, 1, 0)
+
+res_m5 <- performance (y_pred = p_m5_bin,
+                       y_true = Y_test)
+
+roc_m5 <- data.frame(m = p_m5,
+                     d = as.numeric (ap_test$outcome) -1)
+
+## Refit lasso
+X_train_refit <- model.matrix(outcome ~., data = df)[,names(coef_ap_m5)]
+
+
+ap_m5_refit <- glm.fit(x = X_train_refit,
+                       y = Y_train,
+                       family = binomial())
+
+
+# NCVreg
+
+ap_m6 <- cv.ncvreg(X_train,
+                     Y_train,
+                     type = "MCP",
+                     family = "binomial")
+
+coef_ap_m6 <- coef(ap_m6, s = "lambda.min")[coef(ap_m6, s = "lambda.min") != 0]
+
+p_m6 <- predict (ap_m6, type = "response", X  = X_test, lambda = ap_m6$lambda.min)
+p_m6_bin<- ifelse (p_m6 > 0.5, 1, 0)
+
+res_m6 <- performance (y_pred = p_m6_bin,
+                       y_true = Y_test)
+roc_m6 <- data.frame(m = p_m6,
+                     d = as.numeric (ap_test$outcome) -1)
+
+## Refit NCVreg
+X_train_refit <- model.matrix(outcome ~., data = df)[,names(coef_ap_m6)]
+
+
+ap_m6_refit <- glm.fit(x = X_train_refit,
+                       y = Y_train,
+                       family = binomial())
+
+# mboost
+
+df1 <- df %>%
+  mutate (outcome = factor (outcome, levels=0:1)) 
+
+ap_m7  <- glmboost(outcome ~.,
+                      data = df1,
+                      control = boost_control(mstop = 3000, nu = 0.1),
+                      family = Binomial(type = c("glm"))) # coefficients from Binomial(link = 
+cvm <- cvrisk(ap_m7) # , folds = cv10f)
+plot (cvm)
+ap_m7 [mstop(cvm)]
+
+p_m7 <- predict (ap_m7, type = "response", 
+                 newdata  = ap_test %>% dplyr::select (-outcome))
+p_m7_bin <- ifelse (p_m7 > 0.5, 1, 0)
+
+res_m7<- performance (y_pred = p_m7_bin,
+                       y_true = Y_test)
+
+roc_m7 <- data.frame(m = p_m7,
+                     d = as.numeric (ap_test$outcome) -1)
+
+## Refit mboost
+
+coef_ap_m7 <- coef(ap_m7)
+
+X_train_refit <- model.matrix(outcome ~., data = df)[,names(coef_ap_m7)]
+
+
+ap_m7_refit <- glm.fit(x = X_train_refit,
+                       y = Y_train,
+                       family = binomial())
+
+# MARS - linear
+
+ap_m8 <- earth (outcome ~.,
+                   data = df,
+                   linpreds=TRUE,
+                   glm=list(family=binomial))
+
+
+p_m8 <- predict (ap_m8, type = "response", newdata  = ap_test %>% dplyr::select (-outcome))
+p_m8_bin<- ifelse (p_m8 > 0.5, 1, 0)
+
+res_m8 <- performance (y_pred = p_m8_bin,
+                       y_true = Y_test)
+
+roc_m8 <- data.frame(m = p_m8[,1],
+                     d = as.numeric (ap_test$outcome) -1)
+
+
+
+```
+
+## Coef
+
+```{r}
+coef_ap1 <- data.frame (variables = names (coef(ap_m1)),
+                        pval = coef(ap_m1))
+
+coef_ap2 <- data.frame (variables = names (coef(ap_m2)),
+                        pvalAdj = coef(ap_m2))
+
+coef_ap3 <- data.frame (variables = names (coef(ap_m3)),
+                        stepaic = coef(ap_m3))
+
+coef_ap4 <- data.frame (variables = 
+                          rownames (coef(ap_m4 , support.size = best_ap_m4 , sparse = FALSE)),
+                        bestsubset = coef(ap_m4 , support.size = best_ap_m4 , sparse = FALSE)[,1])
+
+coef_ap5 <- data.frame (variables = names (coef(ap_m5, s = "lambda.min")[coef(ap_m5, s = "lambda.min") != 0]),
+                        lasso = coef(ap_m5, s = "lambda.min")[coef(ap_m5, s = "lambda.min") != 0])
+
+coef_ap5_refit <- data.frame (variables = names (coef(ap_m5_refit)),
+                        lasso_refit = coef(ap_m5_refit))
+
+
+coef_ap6 <- data.frame (variables = names (coef(ap_m6, s = "lambda.min")[coef(ap_m6, s = "lambda.min") != 0]),
+                        mcp = coef(ap_m6, s = "lambda.min")[coef(ap_m6, s = "lambda.min") != 0])
+
+
+coef_ap6_refit <- data.frame (variables = names (coef(ap_m6_refit)),
+                        mcp_refit = coef(ap_m6_refit))
+
+
+coef_ap7 <- data.frame (variables = names (coef(ap_m7)),
+                        mboost = coef(ap_m7))
+
+coef_ap7_refit <- data.frame (variables = names (coef(ap_m7_refit)),
+                        mboost_refit = coef(ap_m7_refit))
+
+coef_ap8 <- data.frame (variables = names (coef(ap_m8)),
+                        mars = coef(ap_m8))
+
+
+ap_predictors <- data.frame(variables = colnames (X_train)) %>%
+  left_join(coef_ap1, by = "variables")  %>%
+  left_join(coef_ap2, by = "variables") %>%
+  left_join(coef_ap3, by = "variables") %>%
+  left_join(coef_ap4, by = "variables")%>%
+  left_join(coef_ap5, by = "variables")%>%
+  left_join(coef_ap5_refit, by = "variables")%>%
+  left_join(coef_ap6, by = "variables") %>%
+  #left_join(coef_ap6_refit, by = "variables")%>%
+  left_join(coef_ap7, by = "variables") %>%
+  left_join(coef_ap7_refit, by = "variables")%>%
+  left_join(coef_ap8, by = "variables") %>%
+  mutate_all(~ifelse(.x == 0, NA, .x)) %>%
+  mutate_if(is.numeric, round, 3) %>%
+  mutate (remove = rowSums(is.na(.[,-c(1, 7, 10)])),
+          keep = ifelse (remove == 0, "Y", "N"))
+
+ap_predictors_best <- ap_predictors %>%
+  filter (keep == "Y")
+
+```
+
+
+## Performance
+
+```{r}
+
+models_order <- c("pval", "pvalAdj", "stepaic", 
+                "bestsubset",  "lasso", "ncvreg", "mboost", "mars")
+
+ap_res <- 
+cbind(Model = models_order, 
+      as.data.frame(do.call("rbind", list(res_m1, res_m2, res_m3, 
+                                          res_m4, res_m5, res_m6, res_m7, res_m8)))
+)
+
+ap_roc <- bind_rows (roc_m1,
+                     roc_m2,
+                     roc_m3,
+                     roc_m4,
+                     roc_m5,
+                     roc_m6,
+                     roc_m7,
+                     roc_m8
+                     )
+ap_roc$models <- rep(models_order, each = nrow (roc_m1)) 
+
+ap_roc <- ap_roc %>%
+  mutate (models = factor (models, levels = models_order))
+
+ggplot (ap_roc) +
+  geom_roc (aes (m = m, d = d, color = models))
+```
+
+## Save
+
+```{r}
+ap_all_models <- list ("pval" = ap_m1, 
+                       "pvalAdj" = ap_m2, 
+                       "stepaic" = ap_m3, 
+                       "bestsubset" = ap_m4, 
+                       "lasso"= ap_m5, 
+                       "lasso_refit"= ap_m5_refit, 
+                       "ncvreg"= ap_m6,
+                       "ncvreg_refit"= ap_m6_refit,  
+                       "mboost"= ap_m7, 
+                       "mboost_refit"= ap_m7_refit,
+                       "mars"= ap_m8)
+
+ap <- list (performance = ap_res,
+            predictors = ap_predictors,
+            models = ap_all_models,
+            roc = ap_roc)
+
+saveRDS(ap, "output/ap_iml2.RDS")
+```
+
+
+
+# Disability
+
+## Scaling
+
+```{r}
+scales <- build_scales(dis_train)
+dis_train <- fast_scale(dis_train, scales = scales)
+dis_test <- fast_scale(dis_test, scales = scales)
+```
+
+
+```{r}
+o <- dis_test$outcome
+
+# P value unadjusted
+
+df <- dis_train %>% 
+  mutate (outcome = as.numeric(outcome) - 1) 
+
+fullmodel <- glm(outcome ~., data = df, family = binomial)
+nullmodel <- glm(outcome ~1, data = df, family = binomial)
+
+scope = list(lower=formula(nullmodel ),upper=formula(fullmodel))
+
+dis_m1 = SignifReg(fullmodel,
+                       scope=scope, 
+                       alpha = 0.05,
+                       direction = "both",
+                       criterion = "p-value",
+                       adjust.method = "none",
+                       trace=FALSE)
+
+p_m1 <- predict (dis_m1, type = "response", newdata  = dis_test %>% dplyr::select (-outcome))
+p_m1_bin <- ifelse (p_m1 > 0.5, 1, 0)
+
+res_m1 <- performance (y_pred = p_m1_bin,
+                       y_true = o)
+
+roc_m1 <- data.frame(m = p_m1,
+                     d = as.numeric (dis_test$outcome) -1)
+
+
+# P value adjusted
+
+dis_m2 = SignifReg(fullmodel,
+                       scope=scope, 
+                       alpha = 0.05,
+                       direction = "both",
+                       criterion = "p-value",
+                       adjust.method = "bonferroni",
+                       trace=FALSE)
+
+p_m2 <- predict (dis_m2, type = "response", newdata  = dis_test %>% dplyr::select (-outcome))
+p_m2_bin <- ifelse (p_m2 > 0.5, 1, 0)
+
+res_m2 <- performance (y_pred = p_m2_bin,
+                       y_true = o)
+
+roc_m2 <- data.frame(m = p_m2,
+                     d = as.numeric (dis_test$outcome) -1)
+
+# Step AIC
+
+full_model <- glm (outcome ~ ., data = df, family = binomial())
+dis_m3 <- stepAIC (full_model,
+                      direction = "both")
+
+p_m3 <- predict (dis_m3, type = "response", newdata  = dis_test %>% dplyr::select (-outcome))
+p_m3_bin <- ifelse (p_m3> 0.5, 1, 0)
+
+res_m3 <- performance (y_pred = p_m3_bin,
+                       y_true = o)
+roc_m3 <- data.frame(m = p_m3,
+                     d = as.numeric (dis_test$outcome) -1)
+
+
+# Best subset regression
+
+X_train <-  model.matrix(outcome ~., data = df)[,-1]
+Y_train <- as.numeric (df$outcome) 
+
+X_test <-  model.matrix(outcome ~., data = dis_test)[,-1]
+Y_test <- as.numeric (dis_test$outcome) -1
+
+dis_m4 <- abess(x = X_train,
+                   y = Y_train,
+                   family = "binomial", 
+                   tune.type = "cv"
+                   )
+
+best_dis_m4  <- dis_m4 [["best.size"]]
+
+p_m4 <- predict (dis_m4, type = "response", newx  = X_test, support.size = best_dis_m4)
+p_m4_bin<- as.numeric (ifelse (p_m4 > 0.5, 1, 0))
+
+res_m4 <- performance (y_pred = p_m4_bin,
+                       y_true = Y_test)
+
+roc_m4 <- data.frame(m = p_m4[,1],
+                     d = as.numeric (dis_test$outcome) -1)
+
+# Lasso
+
+dis_m5 <- cv.ncvreg(X_train,
+                       Y_train,
+                       penalty = "lasso",
+                       family = "binomial")
+
+coef_dis_m5 <- coef(dis_m5, s = "lambda.min")[coef(dis_m5, s = "lambda.min") != 0]
+
+p_m5 <- predict (dis_m5, type = "response", X  = X_test, lambda = dis_m5$lambda.min)
+p_m5_bin<- ifelse (p_m5 > 0.5, 1, 0)
+
+res_m5 <- performance (y_pred = p_m5_bin,
+                       y_true = Y_test)
+
+roc_m5 <- data.frame(m = p_m5,
+                     d = as.numeric (dis_test$outcome) -1)
+
+## Refit lasso
+X_train_refit <- model.matrix(outcome ~., data = df)[,names(coef_dis_m5)]
+
+
+dis_m5_refit <- glm.fit(x = X_train_refit,
+                       y = Y_train,
+                       family = binomial())
+
+
+# NCVreg
+
+dis_m6 <- cv.ncvreg(X_train,
+                     Y_train,
+                     type = "MCP",
+                     family = "binomial")
+
+coef_dis_m6 <- coef(dis_m6, s = "lambda.min")[coef(dis_m6, s = "lambda.min") != 0]
+
+p_m6 <- predict (dis_m6, type = "response", X  = X_test, lambda = dis_m6$lambda.min)
+p_m6_bin<- ifelse (p_m6 > 0.5, 1, 0)
+
+res_m6 <- performance (y_pred = p_m6_bin,
+                       y_true = Y_test)
+roc_m6 <- data.frame(m = p_m6,
+                     d = as.numeric (dis_test$outcome) -1)
+
+## Refit NCVreg
+X_train_refit <- model.matrix(outcome ~., data = df)[,names(coef_dis_m6)]
+
+
+dis_m6_refit <- glm.fit(x = X_train_refit,
+                       y = Y_train,
+                       family = binomial())
+
+# mboost
+
+df1 <- df %>%
+  mutate (outcome = factor (outcome, levels=0:1)) 
+
+dis_m7  <- glmboost(outcome ~.,
+                      data = df1,
+                      control = boost_control(mstop = 5000, nu = 0.1),
+                      family = Binomial(type = c("glm"))) # coefficients from Binomial(link = 
+cvm <- cvrisk(dis_m7) # , folds = cv10f)
+plot (cvm)
+dis_m7 [mstop(cvm)]
+
+p_m7 <- predict (dis_m7, type = "response", 
+                 newdata  = dis_test %>% dplyr::select (-outcome))
+p_m7_bin <- ifelse (p_m7 > 0.5, 1, 0)
+
+res_m7<- performance (y_pred = p_m7_bin,
+                       y_true = Y_test)
+
+roc_m7 <- data.frame(m = p_m7,
+                     d = as.numeric (dis_test$outcome) -1)
+
+## Refit mboost
+
+coef_dis_m7 <- coef(dis_m7)
+
+X_train_refit <- model.matrix(outcome ~., data = df)[,names(coef_dis_m7)]
+
+
+dis_m7_refit <- glm.fit(x = X_train_refit,
+                       y = Y_train,
+                       family = binomial())
+
+# MARS - linear
+
+dis_m8 <- earth (outcome ~.,
+                   data = df,
+                   linpreds=TRUE,
+                   glm=list(family=binomial))
+
+
+p_m8 <- predict (dis_m8, type = "response", newdata  = dis_test %>% dplyr::select (-outcome))
+p_m8_bin<- ifelse (p_m8 > 0.5, 1, 0)
+
+res_m8 <- performance (y_pred = p_m8_bin,
+                       y_true = Y_test)
+
+roc_m8 <- data.frame(m = p_m8[,1],
+                     d = as.numeric (dis_test$outcome) -1)
+
+
+
+
+```
+
+## Coef
+
+```{r}
+coef_dis1 <- data.frame (variables = names (coef(dis_m1)),
+                        pval = coef(dis_m1))
+
+coef_dis2 <- data.frame (variables = names (coef(dis_m2)),
+                        pvalAdj = coef(dis_m2))
+
+coef_dis3 <- data.frame (variables = names (coef(dis_m3)),
+                        stepaic = coef(dis_m3))
+
+coef_dis4 <- data.frame (variables = 
+                          rownames (coef(dis_m4 , support.size = best_dis_m4 , sparse = FALSE)),
+                        bestsubset = coef(dis_m4 , support.size = best_dis_m4 , sparse = FALSE)[,1])
+
+coef_dis5 <- data.frame (variables = names (coef(dis_m5, s = "lambda.min")[coef(dis_m5, s = "lambda.min") != 0]),
+                        lasso = coef(dis_m5, s = "lambda.min")[coef(dis_m5, s = "lambda.min") != 0])
+
+coef_dis5_refit <- data.frame (variables = names (coef(dis_m5_refit)),
+                        lasso_refit = coef(dis_m5_refit))
+
+
+coef_dis6 <- data.frame (variables = names (coef(dis_m6, s = "lambda.min")[coef(dis_m6, s = "lambda.min") != 0]),
+                        mcp = coef(dis_m6, s = "lambda.min")[coef(dis_m6, s = "lambda.min") != 0])
+
+
+coef_dis6_refit <- data.frame (variables = names (coef(dis_m6_refit)),
+                        mcp_refit = coef(dis_m6_refit))
+
+
+coef_dis7 <- data.frame (variables = names (coef(dis_m7)),
+                        mboost = coef(dis_m7))
+
+coef_dis7_refit <- data.frame (variables = names (coef(dis_m7_refit)),
+                        mboost_refit = coef(dis_m7_refit))
+
+coef_dis8 <- data.frame (variables = names (coef(dis_m8)),
+                        mars = coef(dis_m8))
+
+
+dis_predictors <- data.frame(variables = colnames (X_train)) %>%
+  left_join(coef_dis1, by = "variables")  %>%
+  left_join(coef_dis2, by = "variables") %>%
+  left_join(coef_dis3, by = "variables") %>%
+  left_join(coef_dis4, by = "variables")%>%
+  left_join(coef_dis5, by = "variables")%>%
+  left_join(coef_dis5_refit, by = "variables")%>%
+  left_join(coef_dis6, by = "variables") %>%
+  #left_join(coef_dis6_refit, by = "variables")%>%
+  left_join(coef_dis7, by = "variables") %>%
+  left_join(coef_dis7_refit, by = "variables")%>%
+  left_join(coef_dis8, by = "variables") %>%
+  mutate_all(~ifelse(.x == 0, NA, .x)) %>%
+  mutate_if(is.numeric, round, 3) %>%
+  mutate (remove = rowSums(is.na(.[,-c(1, 7, 10)])),
+          keep = ifelse (remove == 0, "Y", "N"))
+
+dis_predictors_best <- dis_predictors %>%
+  filter (keep == "Y")
+
+```
+
+
+## Performance
+
+```{r}
+
+models_order <- c("pval", "pvalAdj", "stepaic", 
+                "bestsubset",  "lasso", "ncvreg", "mboost", "mars")
+
+dis_res <- 
+cbind(Model = models_order, 
+      as.data.frame(do.call("rbind", list(res_m1, res_m2, res_m3, 
+                                          res_m4, res_m5, res_m6, res_m7, res_m8)))
+)
+
+dis_roc <- bind_rows (roc_m1,
+                     roc_m2,
+                     roc_m3,
+                     roc_m4,
+                     roc_m5,
+                     roc_m6,
+                     roc_m7,
+                     roc_m8
+                     )
+dis_roc$models <- rep(models_order, each = nrow (roc_m1)) 
+
+dis_roc <- dis_roc %>%
+  mutate (models = factor (models, levels = models_order))
+
+ggplot (dis_roc) +
+  geom_roc (aes (m = m, d = d, color = models))
+```
+
+## Save
+
+```{r}
+dis_all_models <- list ("pval" = dis_m1, 
+                       "pvalAdj" = dis_m2, 
+                       "stepaic" = dis_m3, 
+                       "bestsubset" = dis_m4, 
+                       "lasso"= dis_m5, 
+                       "lasso_refit"= dis_m5_refit, 
+                       "ncvreg"= dis_m6,
+                       "ncvreg_refit"= dis_m6_refit,  
+                       "mboost"= dis_m7, 
+                       "mboost_refit"= dis_m7_refit,
+                       "mars"= dis_m8)
+
+dis <- list (performance = dis_res,
+            predictors = dis_predictors,
+            models = dis_all_models,
+            roc = dis_roc)
+
+saveRDS(dis, "output/dis_iml2.RDS")
+```
+
+
+# Report
+
+```{r}
+res_np <- readRDS("output/np_iml2.RDS")
+res_ap <- readRDS("output/ap_iml2.RDS")
+res_dis <- readRDS("output/dis_iml2.RDS")
+```
+
+## Neck pain
+
+### Performance curves
+
+```{r}
+
+model_lvl <- c("pval", "pvalAdj", "stepaic", 
+               "bestsubset","lasso", "ncvreg", "mboost", "mars")
+model_names <- c("stepP", "stepPAdj", "stepAIC", 
+                 "Best subset", "Lasso", "MCP", "mboost", "MuARS")
+
+outcome_lvl <- c("Accuracy", "Precision", "Sensitivity", "Specificity", "AUC")
+
+df.plot <- res_np$performance %>%
+  pivot_longer(-Model, 
+               names_to = "Outcomes",
+               values_to = "val") %>%
+  mutate (Model = factor (Model, model_lvl, model_names),
+          Outcomes = factor (Outcomes, outcome_lvl))
+
+
+f1 <- ggplot (df.plot) +
+  geom_bar(aes (x = Outcomes, y = val, fill = Model),
+           stat = "identity", position = "dodge") + 
+  scale_fill_manual(values = c("#030303", "#EE6A50", "#FF0000", "#000080", 
+                               "#00EE00", "#8B3E2F", "#4A4A4A", "#A6A6A6")) +
+  ylim (0,1) + 
+  ylab ("Value") +
+  xlab ("Prediction measures") +
+  theme_cowplot() 
+
+tiff ("manuscript2/fig2.tiff", width = 8, height = 3, units = "in", res = 300)
+f1
+dev.off()
+```
+
+### For  export
+
+```{r}
+np_res_df <- df.plot %>%
+  mutate (Outcome = "Neck pain")
+```
+
+### Coefficients
+
+```{r}
+pred <- res_np$predictors %>%
+  dplyr::select (-c(remove, keep))  %>%
+  mutate_if(is.numeric, round, 3) %>%
+  #dplyr::select(-mcp_refit) %>%
+  mutate (Number = rowSums(!is.na(.[, c(2, 3, 4, 5, 6, 8, 9, 11)])))
+
+
+pred[nrow(pred) + 1, 1] <- "Number"
+pred[nrow(pred), -c(1, ncol(pred))] <- colSums(!is.na(pred[,-c(1, ncol(pred))]))
+
+new_names <- c("Variables", "P-value", "P-valueAdj", "Step AIC", 
+                  "Best subset", "Lasso", "Lasso refit",
+                  "MCP", "mboost", "mboost refit", "MuARS", "Number")
+
+names (pred) <- new_names
+
+new_variables <- c("Sex - female",
+               "Age (years)",
+               "Employment - not working",
+               "Employment - working",
+               "Duration of pain (days)",
+               "Time since first episode (years) - 1-5",
+               "Time since first episode (years) - 5–10",
+               "Time since first episode (years) - >10",
+               "Chronicity - chronic",
+               "Baseline intensity of neck pain",
+               "Baseline intensity of arm pain",
+               "Baseline disability",
+               "Diagnostic procedure: X-ray - yes",
+               "Diagnostic procedure: MRI - yes",
+               "Imaging findings: disc degeneration - yes",
+               "Imaging findings: facet joint degeneration - yes",
+               "Imaging findings: scoliosis - yes",
+               "Imaging findings: spinal stenosis - yes",
+               "Imaging findings: disc protrusion - yes",
+               "Imaging findings: disc herniation - yes",
+               "Pharmacological treatment: analgesics - yes",
+               "Pharmacological treatment: NSAIDs - yes",
+               "Pharmacological treatment: steroids - yes",
+               "Pharmacological treatment: muscle relaxants - yes",
+               "Pharmacological treatment: opioids - yes",
+               "Pharmacological treatment: other treatments - yes",
+               "Non pharmacological treatments - yes",
+               "NRT",
+               "Number")
+
+pred$Variables <- new_variables
+# Export to word
+my_path <- paste0("manuscript2/Table 2_v2",
+                  ".docx")
+
+ft <- flextable(pred) %>%
+  width (1, 6, unit = "cm") %>%
+  fontsize(size = 10) %>%
+  set_caption(caption = "Table 2. Beta coefficients of selected variables for the outcome of neck pain",
+              style = "Table Caption")
+
+my_doc <- read_docx()  %>%
+  body_add_flextable(ft) %>%
+  body_end_section_landscape()
+
+print (my_doc, target = my_path)
+```
+
+#### Heat map
+
+```{r}
+pred <- res_np$predictors %>%
+  dplyr::select (-c(remove, keep))  %>%
+  mutate_if(is.numeric, round, 3)
+
+df.plot <- pred %>%
+  pivot_longer(cols = -variables,
+               names_to = "Models",
+               values_to = "Coefs") %>%
+  mutate(Models = factor (Models, levels = model_lvl))
+
+
+h1 <- ggplot(df.plot, aes(Models, variables, fill= Coefs)) + 
+  geom_tile() +
+  scale_fill_gradient(low="white", high="blue") +
+  labs(y = "Variables",
+       fill = "Coefficient") +
+  theme_cowplot()
+
+```
+
+### Probing
+
+```{r}
+probe <- df.plot %>%
+  mutate(val = round (val, 3)) %>%
+  pivot_wider(names_from = Outcomes,
+              values_from = val)
+
+apply (probe[,-1], 2, range)
+
+apply (probe[,-1], 2, range) %>%
+  apply(2, diff)
+
+(mean((pred$Lasso[-nrow(pred)] - pred$`Lasso refit`[-nrow(pred)])/pred$`Lasso refit`[-nrow(pred)], na.rm = TRUE)) *100
+
+
+(mean((pred$mboost[-nrow(pred)] - pred$`mboost refit`[-nrow(pred)])/pred$`mboost refit`[-nrow(pred)], na.rm = TRUE)) *100
+
+
+
+probe <- pred %>%
+  dplyr::select (- c(lasso, mboost, Number)) %>%
+  mutate (Number = rowSums(!is.na(.[, -c (1)]))) %>%
+  filter (Number == 8) %>%
+  dplyr::select (-Number) %>%
+  mutate (ave = rowMeans (.[,c(4:9)], na.rm = TRUE)) %>%
+  mutate (diffP = ((pval - ave)/ave) * 100,
+          diffPA = ((pvalAdj - ave)/ave) * 100) %>%
+  summarize (meanP = mean (diffP),
+             meanPA = mean (diffPA))
+
+probe <- pred %>%
+  dplyr::select (- c(lasso_refit, mboost_refit, Number)) %>%
+  mutate (Number = rowSums(!is.na(.[, -c (1:3)]))) %>%
+  mutate (Impt = ifelse ((is.na(pval) | is.na (pvalAdj)) & Number == 6, 1, 0 )) %>%
+  filter (Impt == 1) 
+```
+
+
+## Arm pain
+
+### Performance curves
+
+```{r}
+
+df.plot <- res_ap$performance %>%
+  pivot_longer(-Model, 
+               names_to = "Outcomes",
+               values_to = "val") %>%
+  mutate (Model = factor (Model, model_lvl, model_names),
+          Outcomes = factor (Outcomes, outcome_lvl))
+
+
+f2 <- ggplot (df.plot) +
+  geom_bar(aes (x = Outcomes, y = val, fill = Model),
+           stat = "identity", position = "dodge") + 
+  scale_fill_manual(values = c("#030303", "#EE6A50", "#FF0000", "#000080", "#00EE00", "#8B3E2F", "#4A4A4A", "#A6A6A6")) +
+  ylim (0,1) + 
+  ylab ("Value") +
+  xlab ("Prediction measures") +
+  theme_cowplot() 
+
+tiff ("manuscript2/fig3.tiff", width = 8, height = 3, units = "in", res = 300)
+f2
+dev.off()
+```
+
+### For export
+
+```{r}
+ap_res_df <- df.plot %>%
+  mutate (Outcome = "Arm pain")
+```
+
+### Coefficients
+
+```{r}
+pred <- res_ap$predictors %>%
+  dplyr::select (-c(remove, keep))  %>%
+  mutate_if(is.numeric, round, 3) %>%
+  #dplyr::select(-mcp_refit) %>%
+  mutate (Number = rowSums(!is.na(.[, c(2, 3, 4, 5, 6, 8, 9, 11)])))
+
+pred[nrow(pred) + 1, 1] <- "Number"
+pred[nrow(pred), -c(1, ncol(pred))] <- as.integer(colSums(!is.na(pred[,-c(1, ncol(pred))])))
+
+
+names (pred) <- new_names
+
+pred$Variables <- new_variables
+# Export to word
+my_path <- paste0("manuscript2/Table 3_v2",
+                   ".docx")
+ft <- flextable(pred) %>%
+  width (1, 6, unit = "cm") %>%
+   fontsize(size = 10) %>%
+   set_caption(caption = "Table 3. Beta coefficients of selected variables for the outcome of arm pain",
+               style = "Table Caption")
+
+my_doc <- read_docx()  %>%
+   body_add_flextable(ft) %>%
+   body_end_section_landscape()
+
+print (my_doc, target = my_path)
+```
+
+
+#### Heat map
+
+```{r}
+pred <- res_ap$predictors %>%
+  dplyr::select (-c(remove, keep))  %>%
+  mutate_if(is.numeric, round, 3)
+
+df.plot <- pred %>%
+  pivot_longer(cols = -variables,
+               names_to = "Models",
+               values_to = "Coefs") %>%
+  mutate(Models = factor (Models, levels = model_lvl))
+
+
+h2 <- ggplot(df.plot, aes(Models, variables, fill= Coefs)) + 
+  geom_tile() +
+  scale_fill_gradient(low="white", high="blue") +
+  labs(y = "Variables",
+       fill = "Coefficient") +
+  theme_cowplot()
+
+```
+
+### Probing
+
+```{r}
+
+probe <- df.plot %>%
+  mutate(val = round (val, 3)) %>%
+  pivot_wider(names_from = Outcomes,
+              values_from = val)
+
+apply (probe[,-1], 2, range)
+
+apply (probe[,-1], 2, range) %>%
+  apply(2, diff)
+
+
+(mean((pred$Lasso[-nrow(pred)] - pred$`Lasso refit`[-nrow(pred)])/pred$`Lasso refit`[-nrow(pred)], na.rm = TRUE)) *100
+
+
+(mean((pred$mboost[-nrow(pred)] - pred$`mboost refit`[-nrow(pred)])/pred$`mboost refit`[-nrow(pred)], na.rm = TRUE)) *100
+
+probe <- pred %>%
+  dplyr::select (- c(lasso, mboost, Number)) %>%
+  mutate (Number = rowSums(!is.na(.[, -c (1)]))) %>%
+  filter (Number == 8) %>%
+  dplyr::select (-Number) %>%
+  mutate (ave = rowMeans (.[,c(4:9)], na.rm = TRUE)) %>%
+  mutate (diffP = ((pval - ave)/ave) * 100,
+          diffPA = ((pvalAdj - ave)/ave) * 100) %>%
+  summarize (meanP = mean (diffP),
+             meanPA = mean (diffPA))
+
+probe <- pred %>%
+  dplyr::select (- c(lasso_refit, mboost_refit, Number)) %>%
+  mutate (Number = rowSums(!is.na(.[, -c (1:3)]))) %>%
+  mutate (Impt = ifelse ((is.na(pval) | is.na (pvalAdj)) & Number == 6, 1, 0 )) %>%
+  filter (Impt == 1) 
+```
+
+
+## Disability
+
+### Performance curves
+
+```{r}
+
+df.plot <- res_dis$performance %>%
+  pivot_longer(-Model, 
+               names_to = "Outcomes",
+               values_to = "val") %>%
+  mutate (Model = factor (Model, model_lvl, model_names),
+          Outcomes = factor (Outcomes, outcome_lvl))
+
+f3 <- ggplot (df.plot) +
+  geom_bar(aes (x = Outcomes, y = val, fill = Model),
+           stat = "identity", position = "dodge") + 
+  scale_fill_manual(values = c("#030303", "#EE6A50", "#FF0000", "#000080", "#00EE00", "#8B3E2F", "#4A4A4A", "#A6A6A6")) +
+  ylim (0,1) + 
+  ylab ("Value") +
+  xlab ("Prediction measures") +
+  theme_cowplot() 
+
+
+tiff ("manuscript2/fig4.tiff", width = 8, height = 3, units = "in", res = 300)
+f3
+dev.off()
+```
+
+### For export
+
+```{r}
+dis_res_df <- df.plot %>%
+  mutate (Outcome = "Disability")
+```
+
+
+### Coefficients
+
+```{r}
+pred <- res_dis$predictors %>%
+  dplyr::select (-c(remove, keep))  %>%
+  mutate_if(is.numeric, round, 3) %>%
+  #dplyr::select(-mcp_refit) %>%
+  mutate (Number = rowSums(!is.na(.[, c(2, 3, 4, 5, 6, 8, 9, 11)])))
+
+pred[nrow(pred) + 1, 1] <- "Number"
+pred[nrow(pred), -c(1, ncol(pred))] <- as.integer(colSums(!is.na(pred[,-c(1, ncol(pred))])))
+
+names (pred) <- new_names
+
+pred$Variables <- new_variables
+
+
+# Export to word
+my_path <- paste0("manuscript2/Table 4_v2",
+                  ".docx")
+ft <- flextable(pred) %>%
+  width (1, 6, unit = "cm") %>%
+  fontsize(size = 10) %>%
+  set_caption(caption = "Table 4. Beta coefficients of selected variables for the outcome of disability",
+              style = "Table Caption")
+
+my_doc <- read_docx()  %>%
+  body_add_flextable(ft) %>%
+  body_end_section_landscape()
+
+print (my_doc, target = my_path)
+```
+
+
+#### Heat map
+
+```{r}
+pred <- res_dis$predictors %>%
+  dplyr::select (-c(remove, keep))  %>%
+  mutate_if(is.numeric, round, 3)
+
+df.plot <- pred %>%
+  pivot_longer(cols = -variables,
+               names_to = "Models",
+               values_to = "Coefs") %>%
+  mutate(Models = factor (Models, levels = model_lvl))
+
+
+h3 <- ggplot(df.plot, aes(Models, variables, fill= Coefs)) + 
+  geom_tile() +
+  scale_fill_gradient(low="white", high="blue") +
+  labs(y = "Variables",
+       fill = "Coefficient") +
+  theme_cowplot()
+
+```
+
+### Probing
+
+```{r}
+
+probe <- df.plot %>%
+  mutate(val = round (val, 3)) %>%
+  pivot_wider(names_from = Outcomes,
+              values_from = val)
+
+apply (probe[,-1], 2, range)
+
+apply (probe[,-1], 2, range) %>%
+  apply(2, diff)
+
+(mean((pred$Lasso[-nrow(pred)] - pred$`Lasso refit`[-nrow(pred)])/pred$`Lasso refit`[-nrow(pred)], na.rm = TRUE)) *100
+
+
+(mean((pred$mboost[-nrow(pred)] - pred$`mboost refit`[-nrow(pred)])/pred$`mboost refit`[-nrow(pred)], na.rm = TRUE)) *100
+
+probe <- pred %>%
+  dplyr::select (- c(lasso, mboost, Number)) %>%
+  mutate (Number = rowSums(!is.na(.[, -c (1)]))) %>%
+  filter (Number == 8) %>%
+  dplyr::select (-Number) %>%
+  mutate (ave = rowMeans (.[,c(4:9)], na.rm = TRUE)) %>%
+  mutate (diffP = ((pval - ave)/ave) * 100,
+          diffPA = ((pvalAdj - ave)/ave) * 100) %>%
+  summarize (meanP = mean (diffP),
+             meanPA = mean (diffPA))
+
+probe <- pred %>%
+  dplyr::select (- c(lasso_refit, mboost_refit, Number)) %>%
+  mutate (Number = rowSums(!is.na(.[, -c (1:3)]))) %>%
+  mutate (Impt = ifelse ((is.na(pval) | is.na (pvalAdj)) & Number == 6, 1, 0 )) %>%
+  filter (Impt == 1) 
+```
+
+```{r}
+
+new_names <- c("Stepwise regression unadjusted P-values", 
+               "Stepwise regression adjusted P-values", 
+               "Stepwise regression AIC", 
+                "Best subset regression", 
+                "Lasso regression", 
+                "Minimax concave penalty regression", 
+                "Model based boosting", 
+                "Multivariate adaptive regression splines")
+
+
+res_df_export <- bind_rows(np_res_df,
+                           ap_res_df,
+                           dis_res_df) %>%
+  rename (Value = val,
+          Metric = Outcomes)%>%
+  dplyr::select (Outcome, everything ()) %>%
+  mutate (Value = round (Value, 3),
+          Model = factor (Model, labels = new_names)) %>%
+  pivot_wider(names_from = "Metric",
+              values_from = "Value")
+
+
+# Export to word
+my_path <- paste0("manuscript2/SM Table1",
+                  ".docx")
+ft <- flextable(res_df_export) %>%
+  width (1, 6, unit = "cm") %>%
+  fontsize(size = 10) %>%
+  set_caption(caption = "Table 4. Beta coefficients of selected variables for the outcome of disability",
+              style = "Table Caption")
+
+my_doc <- read_docx()  %>%
+  body_add_flextable(ft) %>%
+  body_end_section_landscape()
+
+print (my_doc, target = my_path)
+```
+
+
+## Performance combined plot
+
+```{r}
+# arrange the three plots in a single row
+prow <- plot_grid(
+  f1 + theme(legend.position="none"),
+  f2 + theme(legend.position="none"),
+  f3 + theme(legend.position="none"),
+  align = 'vh',
+  labels = c("A", "B", "C"),
+  hjust = -1,
+  ncol = 1
+)
+prow
+
+# extract the legend from one of the plots
+legend <- get_legend(
+  # create some space to the left of the legend
+  f1 + theme(legend.box.margin = margin(0, 0, 0, 12))
+)
+
+# add the legend to the row we made earlier. Give it one-third of 
+# the width of one plot (via rel_widths).
+plot_grid(prow, legend, rel_widths = c(3, .4))
+
+tiff ("manuscript2/fig2.tiff", width = 12, height = 12, units = "in", res = 300)
+plot_grid(prow, legend, rel_widths = c(3, .4))
+dev.off()
+```
+
+## Coefficient heat maps
+
+```{r}
+
+# arrange the three plots in a single row
+prow <- plot_grid(
+  h1 + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)),
+  h2 + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)),
+  h3 + theme(axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)),
+  align = "hv",
+  labels = c("A", "B", "C"),
+  hjust = -1,
+  ncol = 3
+)
+prow
+
+
+tiff ("manuscript2/Suppl_heatmap.tiff", width = 20, height = 8, units = "in", res = 100)
+prow
+dev.off()
+```
+
+## ROC curves
+
+```{r}
+f1 <- res_np$roc %>%
+  mutate (models = factor (models, labels = model_names)) %>%
+  ggplot () +
+  geom_roc(aes (m = m, d = d, color = models), labels = FALSE) + 
+  scale_color_manual(values = c("#030303", "#EE6A50", "#FF0000", "#000080", "#00EE00", "#8B3E2F", "#4A4A4A", "#A6A6A6")) +
+  ylim (0,1) + 
+  ylab ("True positive") +
+  xlab ("False positive") +
+  theme_cowplot() 
+
+f2 <- res_ap$roc %>%
+  mutate (models = factor (models, labels = model_names)) %>%
+  ggplot () +
+  geom_roc(aes (m = m, d = d, color = models), labels = FALSE) + 
+  scale_color_manual(values = c("#030303", "#EE6A50", "#FF0000", "#000080", "#00EE00", "#8B3E2F", "#4A4A4A", "#A6A6A6")) +
+  ylim (0,1) + 
+  ylab ("True positive") +
+  xlab ("False positive") +
+  theme_cowplot() 
+
+f3 <- res_dis$roc %>%
+  mutate (models = factor (models, labels = model_names)) %>%
+  ggplot () +
+  geom_roc(aes (m = m, d = d, color = models), labels = FALSE) + 
+  scale_color_manual(values = c("#030303", "#EE6A50", "#FF0000", "#000080", "#00EE00", "#8B3E2F", "#4A4A4A", "#A6A6A6")) +
+  ylim (0,1) + 
+  ylab ("True positive") +
+  xlab ("False positive") +
+  theme_cowplot() 
+
+# arrange the three plots in a single row
+prow <- plot_grid(
+  f1 + theme(legend.position="none"),
+  f2 + theme(legend.position="none"),
+  f3 + theme(legend.position="none"),
+  align = 'vh',
+  labels = c("A", "B", "C"),
+  hjust = -1,
+  nrow = 1
+)
+prow
+
+# extract the legend from one of the plots
+legend <- get_legend(
+  # create some space to the left of the legend
+  f1 + theme(legend.box.margin = margin(0, 0, 0, 12))
+)
+
+# add the legend to the row we made earlier. Give it one-third of 
+# the width of one plot (via rel_widths).
+plot_grid(prow, legend, rel_widths = c(3, .4))
+
+tiff ("manuscript2/Suppl_pROC.tiff", width = 12, height = 5, units = "in", res = 100)
+plot_grid(prow, legend, rel_widths = c(3, .4))
+dev.off()
+```
+
